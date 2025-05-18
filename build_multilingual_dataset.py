@@ -1,65 +1,95 @@
-import pandas as pd
+import pandas as pd, random, os, sys, json, urllib.request, zipfile
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
-import os, sys
 
-# ── 1. Load CSV ───────────────────────────────────────────────────────────────
-df = pd.read_csv("multilingual_data.csv", dtype=str)
+# ──────────────────────────── CONFIG ────────────────────────────
+CSV_FILE           = "multilingual_data.csv"
+OUT_DIR            = Path("data")
+IMAGE_SIZE         = 128
+IMAGES_PER_CHAR    = 5        # ⬅  change to 1, 5, 100 … whatever you like
+FONTS = {
+    "latin":      "NotoSans-Regular.ttf",
+    "arabic":     "NotoNaskhArabic-Regular.ttf",
+    "devanagari": "NotoSansDevanagari-Regular.ttf",
+}
+# Optional: multiple fonts per script (add extra TTFs to each list)
+# FONTS["latin"] = ["NotoSans-Regular.ttf", "LiberationSans-Regular.ttf", …]
 
-# ── 2. Verify that the code-point = actual glyph ──────────────────────────────
-def ok(row):
-    try:
-        return int(row.Unicode, 16) == ord(row.Character)
-    except Exception:
-        return False
+# ───────────────────── helper: download Noto if missing ─────────────────────
+def ensure_font(path: str, url: str):
+    if Path(path).exists():
+        return path
+    print(f"Downloading {path} …")
+    urllib.request.urlretrieve(url, path)
+    return path
 
-bad = df[~df.apply(ok, axis=1)]
-if not bad.empty:
-    print("❌  Mismatch between Unicode and glyph:\n", bad)
-    sys.exit(1)          # stop if even one row is wrong
-print("✔ All Unicode ↔ glyph pairs are consistent.")
-
-# ── 3. Prepare output folder & helper copies of the tables ────────────────────
-out_dir = Path("data")
-out_dir.mkdir(exist_ok=True)
-
-(df
- .to_csv(out_dir / "char_dataset.csv", index=False))
-
-(df[["file_name", "caption"]]
- .to_json(out_dir / "metadata.jsonl",
-          orient="records", lines=True,
-          force_ascii=False))
-
-# ── 4. Fonts (edit paths if yours live elsewhere) ────────────────────────────
-fonts = {
-    "latin":      "fonts/NotoSans-VariableFont_wdth,wght.ttf",
-    "arabic":     "fonts/NotoNaskhArabic-VariableFont_wght.ttf",
-    "devanagari": "fonts/NotoSansDevanagari-VariableFont_wdth,wght.ttf",
+URLS = {
+    "NotoSans-Regular.ttf":
+        "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Regular.ttf",
+    "NotoNaskhArabic-Regular.ttf":
+        "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoNaskhArabic/NotoNaskhArabic-Regular.ttf",
+    "NotoSansDevanagari-Regular.ttf":
+        "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSansDevanagari/NotoSansDevanagari-Regular.ttf",
 }
 
-LATIN, ARABIC, DEV = (ImageFont.truetype(path, 100) for path in fonts.values())
-
-def choose_font(ch):
-    cp = ord(ch)
-    if   0x0600 <= cp <= 0x06FF:              # Arabic
-        return ARABIC
-    elif 0x0900 <= cp <= 0x097F or cp == 0x0950:  # Devanagari + Om
-        return DEV
+for font in FONTS.values():
+    # handle list vs str
+    if isinstance(font, str):
+        font_paths = [font]
     else:
-        return LATIN
+        font_paths = font
+    for p in font_paths:
+        ensure_font(p, URLS.get(p, ""))
 
-# ── 5. Render each glyph ──────────────────────────────────────────────────────
-def render(ch, font, size=(128, 128)):
-    img  = Image.new("RGB", size, "white")
+# ───────────────────────── load CSV & validate ───────────────────────────────
+df = pd.read_csv(CSV_FILE, dtype=str)
+
+def check_row(row):
+    return int(row.Unicode, 16) == ord(row.Character)
+bad = df[~df.apply(check_row, axis=1)]
+if not bad.empty:
+    print("Unicode ↔ glyph mismatch:\n", bad)
+    sys.exit(1)
+
+# ───────────────────────── font helpers ──────────────────────────────────────
+def pick_font(char):
+    cp = ord(char)
+    if   0x0600 <= cp <= 0x06FF:
+        pool = FONTS["arabic"]
+    elif 0x0900 <= cp <= 0x097F or cp == 0x0950:
+        pool = FONTS["devanagari"]
+    else:
+        pool = FONTS["latin"]
+    if isinstance(pool, str):
+        pool = [pool]
+    return ImageFont.truetype(random.choice(pool), IMAGE_SIZE-28)
+
+def render(char, font):
+    img  = Image.new("L", (IMAGE_SIZE, IMAGE_SIZE), 255)
     draw = ImageDraw.Draw(img)
-    w, h = draw.textbbox((0, 0), ch, font=font)[2:]
-    x, y = (size[0] - w) / 2, (size[1] - h) / 2 - 16   # vertical tweak
-    draw.text((x, y), ch, font=font, fill="black")
+    w, h = draw.textbbox((0, 0), char, font=font)[2:]
+    x, y = (IMAGE_SIZE-w)//2, (IMAGE_SIZE-h)//2 - 8
+    draw.text((x, y), char, font=font, fill=0)
     return img
 
-for row in df.itertuples(index=False):
-    img = render(row.Character, choose_font(row.Character))
-    img.save(out_dir / row.file_name)
+# ───────────────────────── generate images ───────────────────────────────────
+OUT_DIR.mkdir(exist_ok=True)
+rows_out = []
 
-print("✅ PNGs, CSV, and JSONL are ready in ./data/")
+for r in df.itertuples(index=False):
+    for idx in range(IMAGES_PER_CHAR):
+        file_name = f"{r.Unicode}_{idx:03d}.png"
+        img = render(r.Character, pick_font(r.Character))
+        img.save(OUT_DIR / file_name)
+        rows_out.append({
+            "file_name": file_name,
+            "caption":   r.caption
+        })
+
+# ───────────────────────── save CSV + JSONL ─────────────────────────────────
+pd.DataFrame(rows_out).to_csv(OUT_DIR / "char_dataset.csv", index=False)
+with open(OUT_DIR / "metadata.jsonl", "w", encoding="utf-8") as fh:
+    for rec in rows_out:
+        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+print(f"✅  {len(rows_out)} images written to {OUT_DIR}")
